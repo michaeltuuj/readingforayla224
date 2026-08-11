@@ -385,6 +385,16 @@ footer { text-align:center; color:#a4906a; font-size:12px; margin-top:24px; lett
     return 'https://translate.google.com/translate_tts?ie=UTF-8&tl=ar&client=tw-ob&q=' + encodeURIComponent(text);
   }
 
+  // FIX: Chrome now blocks the Google TTS audio with ERR_BLOCKED_BY_ORB when it's
+  // loaded directly into an <audio> tag cross-origin, because that endpoint doesn't
+  // send proper CORS/content-type headers. Routing the request through a CORS-friendly
+  // relay and pulling it in as a blob sidesteps that block, since the relay returns a
+  // clean, non-opaque, correctly-typed response that Chrome will accept.
+  function cloudProxyUrlFor(text) {
+    return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(cloudUrlFor(text));
+  }
+  let currentCloudBlobUrl = null;
+
   function stopCloudRAF() { if (cloudRAF) { cancelAnimationFrame(cloudRAF); cloudRAF = null; } }
 
   function trackCloudProgress(chunkWordIdxs) {
@@ -450,14 +460,30 @@ footer { text-align:center; color:#a4906a; font-size:12px; margin-top:24px; lett
     cloudAudio.addEventListener('ended', onEnded);
     cloudAudio.addEventListener('error', onError);
     cloudAudio.pause();
-    cloudAudio.src = cloudUrlFor(text);
     cloudAudio.playbackRate = parseFloat(rateRange.value);
-    cloudAudio.load();
-    cloudAudio.play().then(() => setPlayingUI(true)).catch(() => {
-      setPlayingUI(false);
-      voiceNotice.textContent = 'تعذّر تشغيل الصوت. اضغط زر التشغيل مرة أخرى. / Playback was blocked — press play again.';
-      voiceNotice.classList.add('show');
-    });
+
+    // FIX: fetch the audio ourselves (through the CORS relay) and hand the browser a
+    // local blob URL, instead of pointing <audio> straight at Google's endpoint. This
+    // avoids the ERR_BLOCKED_BY_ORB failure some browsers now throw on direct opaque
+    // cross-origin audio requests.
+    fetch(cloudProxyUrlFor(text))
+      .then(resp => {
+        if (!resp.ok) throw new Error('bad status ' + resp.status);
+        return resp.blob();
+      })
+      .then(blob => {
+        if (currentCloudBlobUrl) URL.revokeObjectURL(currentCloudBlobUrl);
+        currentCloudBlobUrl = URL.createObjectURL(blob);
+        cloudAudio.src = currentCloudBlobUrl;
+        cloudAudio.load();
+        return cloudAudio.play();
+      })
+      .then(() => setPlayingUI(true))
+      .catch(() => {
+        setPlayingUI(false);
+        voiceNotice.textContent = 'تعذّر الوصول إلى الصوت السحابي حاليًا. جرّب "صوت الجهاز" بدلاً من ذلك. / The cloud voice is unreachable right now. Try Device voice instead.';
+        voiceNotice.classList.add('show');
+      });
   }
 
   const cloudPlayer = {
