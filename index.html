@@ -380,6 +380,10 @@ footer { text-align:center; color:#a4906a; font-size:12px; margin-top:24px; lett
   let cloudRAF = null;
   let cloudStartWordIdx = 0;
   let calibratedCharsPerSecond = 12;
+  // FIX: bumped every time playFrom/stop is called, so a stale chunk-fetch chain from a
+  // previous "Start reading" press can tell it's no longer current and stop scheduling
+  // more requests, instead of silently piling up in parallel with the new one.
+  let cloudRunId = 0;
 
   function cloudUrlFor(text) {
     return 'https://translate.google.com/translate_tts?ie=UTF-8&tl=ar&client=tw-ob&q=' + encodeURIComponent(text);
@@ -422,7 +426,8 @@ footer { text-align:center; color:#a4906a; font-size:12px; margin-top:24px; lett
     cloudRAF = requestAnimationFrame(tick);
   }
 
-  function playCloudChunk(i) {
+  function playCloudChunk(i, runId) {
+    if (runId !== cloudRunId) return; // a newer playFrom()/stop() has superseded this chain — abandon it
     if (i >= cloudChunks.length) { clearHighlights(); setPlayingUI(false); stopCloudRAF(); isPaused = false; return; }
     cloudChunkIdx = i;
     const idxs = cloudChunks[i];
@@ -445,7 +450,7 @@ footer { text-align:center; color:#a4906a; font-size:12px; margin-top:24px; lett
         const bounded = Math.max(6, Math.min(30, measuredRate));
         calibratedCharsPerSecond = calibratedCharsPerSecond * 0.25 + bounded * 0.75;
       }
-      playCloudChunk(i + 1);
+      playCloudChunk(i + 1, runId);
     };
     const onError = () => {
       cloudAudio.removeEventListener('play', onPlay);
@@ -466,39 +471,61 @@ footer { text-align:center; color:#a4906a; font-size:12px; margin-top:24px; lett
     // local blob URL, instead of pointing <audio> straight at Google's endpoint. This
     // avoids the ERR_BLOCKED_BY_ORB failure some browsers now throw on direct opaque
     // cross-origin audio requests.
-    fetch(cloudProxyUrlFor(text))
+    // FIX 2: the free relay can hang indefinitely on some requests, especially longer
+    // chunks of text — so this races the fetch against an 8-second timeout instead of
+    // letting the page get stuck forever with no feedback.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    statusLine.textContent = 'جارٍ التحميل… / Loading…';
+    fetch(cloudProxyUrlFor(text), { signal: controller.signal })
       .then(resp => {
+        clearTimeout(timeoutId);
+        if (runId !== cloudRunId) return Promise.reject(new Error('superseded'));
         if (!resp.ok) throw new Error('bad status ' + resp.status);
         return resp.blob();
       })
       .then(blob => {
+        if (runId !== cloudRunId) return; // superseded while we were fetching — drop it silently
+        statusLine.textContent = '';
         if (currentCloudBlobUrl) URL.revokeObjectURL(currentCloudBlobUrl);
         currentCloudBlobUrl = URL.createObjectURL(blob);
         cloudAudio.src = currentCloudBlobUrl;
         cloudAudio.load();
         return cloudAudio.play();
       })
-      .then(() => setPlayingUI(true))
-      .catch(() => {
+      .then(() => { if (runId === cloudRunId) setPlayingUI(true); })
+      .catch((err) => {
+        clearTimeout(timeoutId);
+        if (runId !== cloudRunId) return; // superseded — don't show a stale error
+        statusLine.textContent = '';
         setPlayingUI(false);
-        voiceNotice.textContent = 'تعذّر الوصول إلى الصوت السحابي حاليًا. جرّب "صوت الجهاز" بدلاً من ذلك. / The cloud voice is unreachable right now. Try Device voice instead.';
+        stopCloudRAF();
+        const timedOut = err && err.name === 'AbortError';
+        voiceNotice.textContent = timedOut
+
+          ? 'انتهت مهلة الاتصال بالصوت السحابي. جرّب نصًا أقصر أو "صوت الجهاز". / The cloud voice timed out. Try shorter text or Device voice instead.'
+          : 'تعذّر الوصول إلى الصوت السحابي حاليًا. جرّب "صوت الجهاز" بدلاً من ذلك. / The cloud voice is unreachable right now. Try Device voice instead.';
         voiceNotice.classList.add('show');
       });
   }
 
   const cloudPlayer = {
     playFrom(index) {
+      cloudRunId++; // invalidate any still-running fetch chain from a previous press
+      const myRun = cloudRunId;
       cloudStartWordIdx = index;
-      cloudChunks = splitIntoChunks(words, 110, 40).map(idxs => idxs.filter(gi => gi >= index));
+      // Smaller chunks (was 110/40) so each request through the CORS relay is quick —
+      // long requests were more likely to hang or time out on the free relay service.
+      cloudChunks = splitIntoChunks(words, 60, 30).map(idxs => idxs.filter(gi => gi >= index));
       cloudChunks = cloudChunks.filter(c => c.length);
       cloudAudio.pause();
-      playCloudChunk(0);
+      playCloudChunk(0, myRun);
       isPaused = false;
     },
     pause() { if (!cloudAudio.paused) { cloudAudio.pause(); isPaused = true; setPlayingUI(false); stopCloudRAF(); } },
     resume() {
       if (!isPaused) return;
-      if (!cloudAudio.src) { playCloudChunk(cloudChunkIdx || 0); isPaused = false; return; }
+      if (!cloudAudio.src) { playCloudChunk(cloudChunkIdx || 0, cloudRunId); isPaused = false; return; }
       cloudAudio.play().then(() => {
         isPaused = false;
         setPlayingUI(true);
@@ -509,7 +536,7 @@ footer { text-align:center; color:#a4906a; font-size:12px; margin-top:24px; lett
         voiceNotice.classList.add('show');
       });
     },
-    stop() { cloudAudio.pause(); cloudAudio.currentTime = 0; stopCloudRAF(); clearHighlights(); setPlayingUI(false); isPaused = false; },
+    stop() { cloudRunId++; cloudAudio.pause(); cloudAudio.currentTime = 0; stopCloudRAF(); clearHighlights(); setPlayingUI(false); isPaused = false; statusLine.textContent = ''; },
     isBusy() { return !cloudAudio.paused || isPaused; }
   };
 
